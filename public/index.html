@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Video Processing Server</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+      h1 { font-size: 1.4rem; }
+      .card { border: 1px solid #e2e2e2; border-radius: 10px; padding: 20px; margin-top: 16px; }
+      .bar { height: 14px; background: #eee; border-radius: 7px; overflow: hidden; margin: 10px 0; }
+      .bar > div { height: 100%; width: 0%; background: #2563eb; transition: width .25s; }
+      .state { font-weight: 600; }
+      .state.READY { color: #16a34a; }
+      .state.FAILED { color: #dc2626; }
+      video { width: 100%; margin-top: 12px; border-radius: 8px; background: #000; }
+      button { background: #2563eb; color: #fff; border: 0; padding: 9px 16px; border-radius: 7px; cursor: pointer; }
+      .muted { color: #6b7280; font-size: .85rem; }
+    </style>
+  </head>
+  <body>
+    <h1>🎬 Video Processing Server</h1>
+    <p class="muted">Upload a video → it's transcoded to adaptive HLS in a background worker. Progress updates live via Server-Sent Events.</p>
+
+    <div class="card">
+      <input type="file" id="file" accept="video/*" />
+      <button id="upload">Upload & Process</button>
+      <div id="status" style="margin-top:16px; display:none">
+        <div>Upload: <span id="uploadPct">0</span>%</div>
+        <div class="bar"><div id="uploadBar"></div></div>
+        <div>Processing: <span class="state" id="state">—</span> <span id="procPct"></span></div>
+        <div class="bar"><div id="procBar"></div></div>
+        <div class="muted" id="msg"></div>
+      </div>
+    </div>
+
+    <div class="card" id="playerCard" style="display:none">
+      <strong>Result (adaptive HLS)</strong>
+      <label style="float:right">
+        Quality:
+        <select id="quality" style="display:none"></select>
+      </label>
+      <video id="video" controls></video>
+      <div class="muted" id="qualityNote"></div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      $('upload').onclick = () => {
+        const file = $('file').files[0];
+        if (!file) return alert('Pick a video first');
+
+        $('status').style.display = 'block';
+        $('playerCard').style.display = 'none';
+        $('state').textContent = 'uploading';
+        $('state').className = 'state';
+
+        const form = new FormData();
+        form.append('video', file);
+
+        // Use XHR so we get real upload-progress events from the browser.
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/videos');
+        xhr.upload.onprogress = (e) => {
+          if (!e.lengthComputable) return;
+          const pct = Math.round((e.loaded / e.total) * 100);
+          $('uploadPct').textContent = pct;
+          $('uploadBar').style.width = pct + '%';
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 300) return alert('Upload failed: ' + xhr.responseText);
+          const { id } = JSON.parse(xhr.responseText);
+          listenForProgress(id);
+        };
+        xhr.onerror = () => alert('Upload error');
+        xhr.send(form);
+      };
+
+      // Open an SSE connection and react to live state changes from the server.
+      function listenForProgress(id) {
+        const es = new EventSource('/api/videos/' + id + '/events');
+        es.onmessage = (ev) => {
+          const job = JSON.parse(ev.data);
+          $('state').textContent = job.state;
+          $('state').className = 'state ' + job.state;
+          $('procPct').textContent = job.progress + '%';
+          $('procBar').style.width = job.progress + '%';
+
+          if (job.state === 'FAILED') {
+            $('msg').textContent = 'Error: ' + (job.error || 'unknown');
+            es.close();
+          }
+          if (job.state === 'READY') {
+            $('msg').textContent = 'Done! Playing adaptive stream.';
+            es.close();
+            play(job.masterUrl);
+          }
+        };
+        es.onerror = () => { /* EventSource auto-reconnects */ };
+      }
+
+      function play(masterUrl) {
+        $('playerCard').style.display = 'block';
+        const video = $('video');
+        const select = $('quality');
+
+        if (Hls.isSupported()) {
+          const hls = new Hls();
+          hls.loadSource(masterUrl);
+          hls.attachMedia(video);
+
+          // Build the quality menu once the master playlist (the rendition list) loads.
+          hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
+            select.innerHTML = '<option value="-1">Auto</option>';
+            data.levels.forEach((lvl, i) => {
+              const opt = document.createElement('option');
+              opt.value = i;
+              opt.textContent = lvl.height ? lvl.height + 'p' : 'Level ' + i;
+              select.appendChild(opt);
+            });
+            select.style.display = 'inline-block';
+          });
+
+          // Manual pick: -1 hands control back to hls.js's adaptive logic.
+          select.onchange = () => {
+            hls.currentLevel = parseInt(select.value, 10);
+          };
+
+          // Reflect which rendition is actually playing while on "Auto".
+          hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
+            const h = hls.levels[data.level] && hls.levels[data.level].height;
+            $('qualityNote').textContent =
+              select.value === '-1' && h ? 'Auto — currently ' + h + 'p' : '';
+          });
+        } else {
+          // Safari plays HLS natively (auto-only; no manual level API here).
+          video.src = masterUrl;
+          $('qualityNote').textContent = 'Native HLS playback (auto quality).';
+        }
+      }
+    </script>
+  </body>
+</html>

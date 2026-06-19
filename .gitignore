@@ -1,0 +1,9 @@
+node_modules/
+dist/
+uploads/
+storage/
+*.log
+.DS_Store
+!.env.example
+# Keep .env in the repo for this learning scaffold; in real projects, gitignore it.
+config.bat
